@@ -1,0 +1,19 @@
+model:
+  name: "large-v3"        # tiny, base, small, medium, large-v1, large-v2, large-v3
+  language: "ko"
+  compute_type: "float16"  # float16 (GPU), int8 (CPU/저사양)
+  device: "cuda"           # cuda | cpu
+
+transcription:
+  batch_size: 16
+  chunk_size: 30           # seconds
+  beam_size: 5             # 1=greedy, 5=기본값. 높을수록 정확도↑ 속도↓
+  temperature: 0           # 0=beam search 고정. 0 이상이면 sampling으로 전환
+
+alignment:
+  enabled: true            # 단어 단위 타임스탬프 정렬
+
+diarization:
+  enabled: false           # 화자 분리 (HF_TOKEN 필요)
+  min_speakers: null
+  max_speakers: null
