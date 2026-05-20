@@ -1,79 +1,13 @@
 #!/usr/bin/env python3
 """
-Single-file WhisperX transcription entry point.
+단일 음성 파일 전사.
 Usage: python run.py --audio <file> [--config config.yaml] [--output <file>]
 """
 
 import argparse
 import json
-import os
 import sys
 from pathlib import Path
-
-import yaml
-
-
-def load_config(config_path: str) -> dict:
-    with open(config_path) as f:
-        return yaml.safe_load(f)
-
-
-def transcribe(audio_path: str, cfg: dict) -> dict:
-    import whisperx
-
-    model_cfg = cfg["model"]
-    device = model_cfg["device"]
-    compute_type = model_cfg["compute_type"]
-
-    print(f"[1/3] 모델 로드: {model_cfg['name']} ({device}, {compute_type})")
-    model = whisperx.load_model(
-        model_cfg["name"],
-        device,
-        compute_type=compute_type,
-        language=model_cfg["language"],
-    )
-
-    print(f"[2/3] 전사 중: {audio_path}")
-    audio = whisperx.load_audio(audio_path)
-    result = model.transcribe(
-        audio,
-        batch_size=cfg["transcription"]["batch_size"],
-        chunk_size=cfg["transcription"]["chunk_size"],
-        language=model_cfg["language"],
-        beam_size=cfg["transcription"].get("beam_size", 5),
-        temperature=cfg["transcription"].get("temperature", 0),
-    )
-
-    if cfg["alignment"]["enabled"]:
-        print("[2/3] 정렬 중 (단어 타임스탬프)...")
-        align_model, metadata = whisperx.load_align_model(
-            language_code=result["language"], device=device
-        )
-        result = whisperx.align(
-            result["segments"], align_model, metadata, audio, device,
-            return_char_alignments=False,
-        )
-
-    if cfg["diarization"]["enabled"]:
-        hf_token = os.environ.get("HF_TOKEN")
-        if not hf_token:
-            print("[경고] HF_TOKEN 환경변수가 없어 화자 분리를 건너뜁니다.", file=sys.stderr)
-        else:
-            print("[3/3] 화자 분리 중...")
-            diarize_cfg = cfg["diarization"]
-            diarize_model = whisperx.DiarizationPipeline(
-                use_auth_token=hf_token, device=device
-            )
-            diarize_segments = diarize_model(
-                audio,
-                min_speakers=diarize_cfg["min_speakers"],
-                max_speakers=diarize_cfg["max_speakers"],
-            )
-            result = whisperx.assign_word_speakers(diarize_segments, result)
-    else:
-        print("[3/3] 화자 분리 건너뜀 (config: diarization.enabled=false)")
-
-    return result
 
 
 def format_output(result: dict) -> str:
@@ -83,14 +17,14 @@ def format_output(result: dict) -> str:
         end = seg.get("end", 0)
         text = seg.get("text", "").strip()
         speaker = seg.get("speaker", "")
-        ts = f"[{start:06.2f} --> {end:06.2f}]"
+        ts = f"[{start:07.3f} --> {end:07.3f}]"
         prefix = f"  {speaker}" if speaker else ""
         lines.append(f"{ts}{prefix}  {text}")
     return "\n".join(lines)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="WhisperX STT")
+    parser = argparse.ArgumentParser(description="STT 단일 파일 전사")
     parser.add_argument("--audio", required=True, help="입력 음성 파일 경로")
     parser.add_argument(
         "--config",
@@ -104,8 +38,15 @@ def main():
         print(f"[오류] 파일을 찾을 수 없습니다: {args.audio}", file=sys.stderr)
         sys.exit(1)
 
+    from pipeline import build_from_config, load_config
     cfg = load_config(args.config)
-    result = transcribe(args.audio, cfg)
+    p = cfg.get("pipeline", {})
+    print(f"VAD: {p.get('vad', {}).get('model', '?')}  "
+          f"STT: {p.get('stt', {}).get('model_id', '?')} ({p.get('stt', {}).get('backend', '?')})  "
+          f"Diar: {'on' if p.get('diarization', {}).get('enabled') else 'off'}")
+
+    pipeline = build_from_config(cfg)
+    result = pipeline.run(args.audio)
     formatted = format_output(result)
 
     print("\n" + "=" * 60)

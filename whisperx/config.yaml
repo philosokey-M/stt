@@ -1,19 +1,140 @@
-model:
-  name: "large-v3"        # tiny, base, small, medium, large-v1, large-v2, large-v3
-  language: "ko"
-  compute_type: "float16"  # float16 (GPU), int8 (CPU/저사양)
-  device: "cuda"           # cuda | cpu
+# ============================================================
+# STT 파이프라인 설정
+# ============================================================
+# 각 단계(VAD / STT / 화자분리)는 독립적으로 교체 가능합니다.
+# 현재 기본값은 Phase 2 (whisperx) 동작과 동일합니다.
+#
+# 로컬 오버라이드: config.local.yaml 을 같은 디렉토리에 생성하면
+# 이 파일을 수정하지 않고 설정을 덮어쓸 수 있습니다. (git 무시됨)
 
-transcription:
-  batch_size: 16
-  chunk_size: 30           # seconds
-  beam_size: 5             # 1=greedy, 5=기본값. 높을수록 정확도↑ 속도↓
-  temperature: 0           # 0=beam search 고정. 0 이상이면 sampling으로 전환
+pipeline:
 
-alignment:
-  enabled: true            # 단어 단위 타임스탬프 정렬
+  # ----------------------------------------------------------
+  # 1단계 — VAD (Voice Activity Detection)
+  # ----------------------------------------------------------
+  # 음성 구간을 미리 검출해 STT에 넘깁니다.
+  # whisperx 백엔드 사용 시 whisperx가 내부 VAD를 직접 처리하므로
+  # "disabled" 를 권장합니다.
+  #
+  # model 옵션:
+  #   "disabled"  — VAD 단계 건너뜀. STT 모델 내부 VAD 사용.
+  #                 backend: whisperx 와 함께 사용 (Phase 2 동작)
+  #   "silero"    — faster-whisper 내장 Silero VAD. HF 토큰 불필요.
+  #                 backend: faster-whisper / transformers 와 함께 사용.
+  #   "pyannote"  — pyannote.audio VAD. HF_TOKEN 환경변수 필요.
+  #                 silero 대비 더 정밀하나 느림.
+  #
+  vad:
+    model: "disabled"
 
-diarization:
-  enabled: false           # 화자 분리 (HF_TOKEN 필요)
-  min_speakers: null
-  max_speakers: null
+    # [pyannote 전용] HuggingFace 모델 ID
+    # 예시:
+    #   "pyannote/voice-activity-detection"   — 기본 VAD
+    #   "pyannote/segmentation-3.0"           — 최신, 더 정밀
+    model_id: "pyannote/voice-activity-detection"
+
+    # [silero 전용] 감지 민감도 파라미터
+    onset: 0.500                  # 음성 시작 감지 임계값 (0~1, 높을수록 엄격)
+    offset: 0.363                 # 음성 종료 감지 임계값 (0~1)
+    min_speech_duration_ms: 250   # 이 길이 미만의 음성 구간 무시
+    min_silence_duration_ms: 2000 # 이 길이 이상의 침묵만 구간 경계로 인식
+
+  # ----------------------------------------------------------
+  # 2단계 — STT (Speech-to-Text)
+  # ----------------------------------------------------------
+  # backend 옵션:
+  #   "whisperx"       — whisperx 전체 파이프라인 (Phase 2 동일).
+  #                      transcribe + align (단어 수준 타임스탬프) 포함.
+  #                      Whisper 계열 모델만 지원.
+  #                      vad.model: "disabled" 와 함께 사용 권장.
+  #   "faster-whisper" — CTranslate2 최적화 Whisper. 경량·고속.
+  #                      align 단계 없음. vad: silero/pyannote 와 조합 가능.
+  #   "transformers"   — HuggingFace ASR 파이프라인.
+  #                      Whisper 외 wav2vec2, MMS 등 모든 HF ASR 모델 지원.
+  #                      align 단계 없음.
+  #
+  stt:
+    backend: "whisperx"
+
+    # model_id: 사용할 모델 식별자
+    #
+    # [whisperx / faster-whisper 백엔드] — Whisper 모델 크기
+    #   "tiny"          — 39M  파라미터, 최고속, 낮은 정확도
+    #   "base"          — 74M
+    #   "small"         — 244M
+    #   "medium"        — 769M
+    #   "large-v1"      — 1550M
+    #   "large-v2"      — 1550M, large-v1 개선
+    #   "large-v3"      — 1550M, 현재 최고 정확도 (기본값)
+    #
+    # HuggingFace의 faster-whisper 포맷 모델도 사용 가능:
+    #   "Systran/faster-whisper-large-v3"
+    #   "Systran/faster-whisper-medium"
+    #   "deepdml/faster-whisper-large-v3-turbo-ct2"  — 속도 최적화
+    #
+    # [transformers 백엔드] — 일반 HF ASR 모델
+    # Whisper 계열:
+    #   "openai/whisper-large-v3"
+    #   "openai/whisper-medium"
+    #   "SungBeom/whisper-small-ko"          — 한국어 특화 fine-tune
+    #   "kresnik/wav2vec2-large-xlsr-korean" — wav2vec2 한국어
+    # 비(非)Whisper:
+    #   "facebook/mms-300m"                  — Meta MMS 다국어 (300M)
+    #   "facebook/mms-1b-fl102"              — Meta MMS 대형
+    #   "patrickvonplaten/wav2vec2-large-xlsr-53-korean"
+    #
+    model_id: "large-v3"
+
+    language: "ko"                # 전사 언어 코드 (ko, en, ja, zh, ...)
+    device: "cuda"                # cuda | cpu
+    compute_type: "float16"       # float16  — GPU 권장 (빠름)
+                                  # int8     — CPU 또는 GPU 메모리 부족 시
+                                  # int8_float16 — GPU 메모리 절약하면서 속도 유지
+
+    # [whisperx 전용 파라미터]
+    batch_size: 16                # 배치 크기. GPU 메모리에 따라 조정 (8 / 16 / 32)
+    align: true                   # true  — whisperx.align() 실행, 단어 수준 타임스탬프
+                                  # false — 세그먼트 수준 타임스탬프만 (빠름)
+
+    # [faster-whisper / transformers 공통 파라미터]
+    beam_size: 5                  # 빔 서치 크기 (1~10, 높을수록 정확하나 느림)
+    temperature: 0                # 0   — 결정적 출력 (권장)
+                                  # 0.2~1.0 — 확률적 출력 (다양성 증가)
+
+  # ----------------------------------------------------------
+  # 3단계 — 화자분리 (Speaker Diarization)
+  # ----------------------------------------------------------
+  # enabled: true 시 HF_TOKEN 환경변수 필요
+  #   export HF_TOKEN=<huggingface_token>
+  # HuggingFace 모델 페이지에서 사용 약관 동의 필요:
+  #   https://huggingface.co/pyannote/speaker-diarization-3.1
+  #
+  # model 옵션:
+  #   "pyannote" — pyannote.audio 기반 화자분리 (현재 구현체)
+  #               NeMo, SpeechBrain 등은 stages/diarizer.py 에
+  #               클래스 추가 후 사용 가능
+  #
+  diarization:
+    enabled: false
+    model: "pyannote"
+
+    # model_id: HuggingFace의 pyannote 화자분리 모델
+    # 예시:
+    #   "pyannote/speaker-diarization-3.1"  — 최신 권장
+    #   "pyannote/speaker-diarization-3.0"
+    #   "pyannote/speaker-diarization"      — 구버전
+    model_id: "pyannote/speaker-diarization-3.1"
+
+    min_speakers: null            # 최소 화자 수 (null = 자동 추정)
+    max_speakers: null            # 최대 화자 수 (null = 자동 추정)
+                                  # 화자 수를 알고 있으면 지정 시 정확도 향상
+                                  # 예: min_speakers: 2, max_speakers: 2
+
+# ----------------------------------------------------------
+# HuggingFace 토큰
+# ----------------------------------------------------------
+# pyannote VAD / 화자분리 모델 사용 시 필요.
+# 환경변수 HF_TOKEN 이 설정되어 있으면 이 값보다 우선합니다.
+# 보안을 위해 config.local.yaml 에 작성하거나 환경변수 사용 권장.
+#
+# hf_token: ""

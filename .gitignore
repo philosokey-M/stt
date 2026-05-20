@@ -1,2 +1,4 @@
 /test-data
 /results
+*.local.yaml
+__pycache__/

@@ -8,18 +8,18 @@ WhisperX를 시작점으로 VAD / STT / 화자분리 각 단계를 독립적으�
 ## 환경 설정
 
 ```bash
-conda activate stt
+conda activate lxp_ai
 
-# whisperx 설치
 pip install -r requirements.txt
 ```
 
-GPU 없는 경우 `whisperx/config.yaml` 수정:
+GPU 없는 경우 `config.yaml` 수정:
 
 ```yaml
-model:
-  device: "cpu"
-  compute_type: "int8"
+pipeline:
+  stt:
+    device: "cpu"
+    compute_type: "int8"
 ```
 
 ---
@@ -49,40 +49,36 @@ n/ 아닙니다. 무통장입금으로 하면 좋았을 것을. 그건 또 할�
 
 ## 작업 계획
 
-### Phase 1 — WhisperX 기본 STT ✅
+### Phase 1 — 기본 STT 스크립트 ✅
 
-음성 파일 하나를 인자로 받아 전사 결과를 출력하는 스크립트.
+음성 파일 하나를 인자로 받아 전사 결과를 출력.
 
 ```bash
-python whisperx/run.py --audio test-data/sample_01/raw_data/KtelSpeech_train_D60_wav_0/J91/S00007750/0001.wav
+# whisperx/ 디렉토리 안에서 실행
+python run.py --audio ../test-data/sample_01/raw_data/KtelSpeech_train_D60_wav_0/J91/S00007750/0001.wav
 
-# 결과를 파일로 저장
-python whisperx/run.py --audio <파일경로> --output result.txt    # 텍스트
-python whisperx/run.py --audio <파일경로> --output result.json   # 타임스탬프 포함
+# 결과 저장
+python run.py --audio <파일경로> --output result.txt
+python run.py --audio <파일경로> --output result.json
 ```
 
 출력 포맷:
 
 ```
-[00:00.00 --> 00:03.20]  네 안녕하세요 제 번호로 조회해서 정보 한번 보시겠어요
+[000.000 --> 003.200]  네 안녕하세요 제 번호로 조회해서 정보 한번 보시겠어요
 ```
 
 ### Phase 2 — 한국어 성능 벤치마크 ✅
 
-WER / CER / RTF 지표를 산출하고 `results/` 디렉토리에 결과를 저장.
+WER / CER / RTF 지표 산출 후 `results/`에 JSON 저장.
 
 ```bash
-# 빠른 검증 (N개 파일)
-python whisperx/benchmark.py --data-dir test-data/sample_01 --limit 50
-
-# 전체 평가 (5,260개)
-python whisperx/benchmark.py --data-dir test-data/sample_01
-
-# 다른 config 사용
-python whisperx/benchmark.py --data-dir test-data/sample_01 --config whisperx/config.yaml
+# whisperx/ 디렉토리 안에서 실행
+python benchmark.py --data-dir ../test-data/sample_01 --limit 50   # 빠른 검증
+python benchmark.py --data-dir ../test-data/sample_01               # 전체 (5,260개)
 ```
 
-결과 파일: `results/benchmark_<model>_<timestamp>.json`
+결과 파일: `results/benchmark_<stt_model>_<vad>_<timestamp>.json`
 
 ```
 평균 WER   : 0.1234  (12.34%)
@@ -90,23 +86,22 @@ python whisperx/benchmark.py --data-dir test-data/sample_01 --config whisperx/co
 전체 RTF   : 0.0421
 ```
 
-### Phase 3 — 모듈형 파이프라인 (예정)
+### Phase 3 — 모듈형 파이프라인 ✅
 
-VAD / STT / Diarization 각 단계를 `config.yaml`만 수정해 교체 가능하도록 구조 변경.
+VAD / STT / Diarization을 독립 클래스로 분리. `config.yaml`만 바꿔서 조합 교체 가능.
 
-계획 중인 config 구조:
-
-```yaml
-vad:
-  model: "silero"        # silero | pyannote | webrtc
-
-stt:
-  model: "large-v3"
-
-diarization:
-  model: "pyannote"      # pyannote | nemo | speechbrain
-  enabled: false
 ```
+stages/
+  vad.py       # VADBase, SileroVAD, PyannoteVAD
+  stt.py       # STTBase, FasterWhisperSTT
+  diarizer.py  # DiarizationBase, PyannotesDiarizer
+pipeline.py    # Pipeline + build_from_config()
+```
+
+새 모델 추가 방법:
+1. 해당 `stages/*.py`에 클래스 구현 (`VADBase` 등 상속)
+2. `*_REGISTRY`에 등록
+3. `config.yaml`에서 `model:` 값 변경
 
 ### Phase 4 — 조합 탐색 자동화 (예정)
 
@@ -114,30 +109,34 @@ diarization:
 
 ```bash
 # 예정된 사용법
-python whisperx/sweep.py --data-dir test-data/sample_01 --limit 100
+python sweep.py --data-dir ../test-data/sample_01 --limit 100
 ```
 
 ---
 
-## 설정 파일 (`whisperx/config.yaml`)
+## 설정 파일 (`config.yaml`)
 
 ```yaml
-model:
-  name: "large-v3"       # tiny | base | small | medium | large-v1 | large-v2 | large-v3
-  language: "ko"
-  compute_type: "float16" # float16 (GPU) | int8 (CPU)
-  device: "cuda"          # cuda | cpu
+pipeline:
+  vad:
+    model: "silero"           # silero | pyannote | disabled
+    onset: 0.500
+    offset: 0.363
+    min_speech_duration_ms: 250
+    min_silence_duration_ms: 2000
 
-transcription:
-  batch_size: 16
-  beam_size: 5            # 1=greedy, 5=기본값. 높을수록 정확도↑ 속도↓
-  temperature: 0          # 0=beam search 고정
+  stt:
+    backend: "faster-whisper"
+    model: "large-v3"         # tiny | base | small | medium | large-v1 | large-v2 | large-v3
+    language: "ko"
+    device: "cuda"            # cuda | cpu
+    compute_type: "float16"   # float16 (GPU) | int8 (CPU)
+    beam_size: 5
+    temperature: 0
 
-alignment:
-  enabled: true           # 단어 단위 타임스탬프
-
-diarization:
-  enabled: false          # true 시 HF_TOKEN 환경변수 필요
+  diarization:
+    model: "pyannote"
+    enabled: false            # true 시 HF_TOKEN 환경변수 필요
 ```
 
 ---
@@ -146,14 +145,19 @@ diarization:
 
 ```
 stt/
-├── README.md
 ├── CLAUDE.md
 ├── test-data/
-│   └── sample_01/           # KtelSpeech 샘플 데이터
+│   └── sample_01/               # KtelSpeech 샘플 데이터
 └── whisperx/
-    ├── run.py               # 단일 파일 전사
-    ├── benchmark.py         # 성능 벤치마크
-    ├── config.yaml          # 모델 설정
-    └── requirements.txt
+    ├── README.md
+    ├── run.py                   # 단일 파일 전사
+    ├── benchmark.py             # 성능 벤치마크
+    ├── pipeline.py              # Pipeline + build_from_config()
+    ├── config.yaml              # 파이프라인 설정
+    ├── requirements.txt
+    └── stages/
+        ├── vad.py               # SileroVAD, PyannoteVAD
+        ├── stt.py               # FasterWhisperSTT
+        └── diarizer.py          # PyannotesDiarizer
 ```
 
