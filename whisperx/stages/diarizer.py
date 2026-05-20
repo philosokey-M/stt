@@ -25,7 +25,7 @@ class PyannotesDiarizer(DiarizationBase):
 
         model_id = cfg.get("model_id", "pyannote/speaker-diarization-3.1")
         token = cfg.get("hf_token") or os.environ.get("HF_TOKEN")
-        self._pipeline = Pipeline.from_pretrained(model_id, use_auth_token=token)
+        self._pipeline = Pipeline.from_pretrained(model_id, token=token)
         self._min_speakers = cfg.get("min_speakers")
         self._max_speakers = cfg.get("max_speakers")
 
@@ -39,14 +39,17 @@ class PyannotesDiarizer(DiarizationBase):
         if self._max_speakers:
             kwargs["max_speakers"] = self._max_speakers
 
-        diarization = self._pipeline(
+        result = self._pipeline(
             {"waveform": waveform, "sample_rate": SAMPLE_RATE}, **kwargs
         )
+        # pyannote 3.x returns DiarizeOutput with speaker_diarization field
+        # older versions return Annotation directly
+        annotation = getattr(result, "speaker_diarization", result)
 
         for seg in segments:
             mid = (seg["start"] + seg["end"]) / 2
             seg["speaker"] = "UNKNOWN"
-            for turn, _, spk in diarization.itertracks(yield_label=True):
+            for turn, _, spk in annotation.itertracks(yield_label=True):
                 if turn.start <= mid <= turn.end:
                     seg["speaker"] = spk
                     break

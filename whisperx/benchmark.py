@@ -168,6 +168,7 @@ def main():
             "cer": round(c, 4),
             "rtf": round(rtf, 4),
             "elapsed_s": round(elapsed, 3),
+            "segments": result.get("segments", []),
         })
 
         print(f"[{i:4d}/{len(pairs)}] WER={w:.3f} CER={c:.3f} RTF={rtf:.3f}  {wav_path.name}")

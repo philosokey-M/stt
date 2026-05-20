@@ -49,7 +49,7 @@ class PyannoteVAD(VADBase):
 
         model_id = cfg.get("model_id", "pyannote/voice-activity-detection")
         token = cfg.get("hf_token") or os.environ.get("HF_TOKEN")
-        self._pipeline = Pipeline.from_pretrained(model_id, use_auth_token=token)
+        self._pipeline = Pipeline.from_pretrained(model_id, token=token)
 
     def detect(self, audio: np.ndarray) -> list[dict]:
         import torch
