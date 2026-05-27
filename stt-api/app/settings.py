@@ -62,6 +62,7 @@ class ServerSettings(BaseModel):
     port: int
     log_level: str
     max_upload_mb: int
+    min_audio_duration_s: int
     job_ttl_seconds: int
     max_concurrent_inferences: int
     io_worker_threads: int
@@ -148,6 +149,7 @@ def load_settings() -> APISettings:
         port=_env_int("PORT", 8000),
         log_level=(_env("LOG_LEVEL", "info") or "info").lower(),
         max_upload_mb=_env_int("MAX_UPLOAD_MB", 200),
+        min_audio_duration_s=_env_int("MIN_AUDIO_DURATION_S", 1),
         job_ttl_seconds=_env_int("JOB_TTL_SECONDS", 3600),
         max_concurrent_inferences=max(1, _env_int("MAX_CONCURRENT_INFERENCES", 1)),
         io_worker_threads=max(1, _env_int("IO_WORKER_THREADS", 4)),

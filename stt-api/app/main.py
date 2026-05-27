@@ -15,6 +15,8 @@ import asyncio
 import logging
 import os
 import tempfile
+import mutagen
+import io
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -145,6 +147,20 @@ def _cleanup(path: str | Path) -> None:
         log.warning("임시 파일 삭제 실패 %s: %s", path, e)
 
 
+async def _check_audio_file(file: UploadFile) -> None:
+    file_bytes = await file.read()
+    try:
+        audio_file = io.BytesIO(file_bytes)
+        audio = mutagen.File(audio_file)
+        if audio is None or audio.info is None:
+            raise HTTPException(status_code=400, detail="지원하지 않거나 손상된 오디오 파일입니다.")
+        duration = audio.info.length
+        if duration < SETTINGS.server.min_audio_duration_s:
+            raise HTTPException(status_code=400, detail=f"오디오 파일 길이가 너무 짧습니다. 최소 {SETTINGS.server.min_audio_duration_s}초")
+        
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"오류 발생: {str(e)}")
+
 # --------------------------------------------------------------------------- endpoints
 
 
@@ -186,6 +202,10 @@ async def transcribe(
     reference: str | None = Form(None, description="정답 텍스트. 제공되면 wer/cer 계산."),
 ):
     """동기 전사. 짧은 오디오에 권장."""
+    # TODO : 화자 최대, 최소 수 파라미터로 제어 하도록 수정해야함 (없으면 자동 추정)
+    await _check_audio_file(file)
+
+    
     mgr = get_manager()
     if not mgr.is_ready():
         raise HTTPException(status_code=503, detail="모델 로딩 중")
@@ -211,6 +231,9 @@ async def transcribe_async(
     reference: str | None = Form(None),
 ):
     """비동기 전사. 긴 파일에 권장. job_id 를 반환하며 결과는 /jobs/{id} 로 폴링."""
+    # TODO : 화자 최대, 최소 수 파라미터로 제어 하도록 수정해야함 (없으면 자동 추정)
+    await _check_audio_file(file)
+
     mgr = get_manager()
     if not mgr.is_ready():
         raise HTTPException(status_code=503, detail="모델 로딩 중")
