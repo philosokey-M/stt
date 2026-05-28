@@ -16,6 +16,7 @@ import logging
 import os
 import shutil
 import tempfile
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -87,6 +88,7 @@ def _build_response(
     result: TranscribeResult,
     requested_language: str | None,
     reference: str | None,
+    total_elapsed_s: float | None = None,
 ) -> TranscribeResponse:
     full_text = " ".join(s["text"] for s in result.segments).strip()
 
@@ -96,6 +98,7 @@ def _build_response(
         # router 가 실제로 사용한 언어를 그대로 노출 (요청 미지정 시 default)
         "language": result.language or requested_language or _default_language(),
         "elapsed_s": result.elapsed_s,
+        "total_elapsed_s": round(total_elapsed_s, 3) if total_elapsed_s is not None else None,
         "audio_duration_s": result.audio_duration_s,
         "rtf": round(result.rtf, 4) if result.rtf is not None else None,
     }
@@ -252,11 +255,31 @@ async def transcribe(
     ),
     reference: str | None = Form(None, description="정답 텍스트. 제공되면 wer/cer 계산."),
 ):
-    """동기 전사. 짧은 오디오에 권장."""
+    """
+    동기 전사. 짧은 오디오에 권장.
+    Returns:
+        dict: 아래와 같은 구조의 STT 결과 딕셔너리를 반환합니다.
+            - segments (list): 오디오를 문장/의미 단위로 분할한 상세 분석 결과 목록
+                - start (float): 해당 구간의 시작 시간 (초 단위)
+                - end (float): 해당 구간의 종료 시간 (초 단위)
+                - text (str): 해당 구간에서 인식된 텍스트 내용
+                - speaker (str): 화자 식별 ID (예: SPEAKER_00)
+            - text (str): 오디오 전체를 텍스트로 변환한 통합 결과
+            - language (str): 오디오에서 감지되거나 지정된 언어 코드 (예: 'ko')
+            - elapsed_s (float): 순수 STT 모델 추론(Inference)에 걸린 시간 (초 단위)
+            - total_elapsed_s (float): 전/후처리를 포함하여 API 요청부터 완료까지의 총 소요 시간 (초 단위)
+            - audio_duration_s (float): 입력된 전체 오디오 파일의 총 길이 (초 단위)
+            - rtf (float): Real-Time Factor (실시간 처리 지수, elapsed_s / audio_duration_s)
+                        (1보다 작을수록 실시간보다 빠르게 처리됨을 의미)
+            - ref (str, optional): 정답 텍스트 (성능 검증/벤치마크 모드가 아닐 경우 null)
+            - hyp (str, optional): 모델 예측 텍스트 (성능 검증/벤치마크 모드가 아닐 경우 null)
+            - wer (float, optional): Word Error Rate (단어 오류율, 성능 검증용 지표)
+            - cer (float, optional): Character Error Rate (문자 오류율, 한국어 STT 주요 평가지표)
+    """
     # TODO : 화자 최대, 최소 수 파라미터로 제어 하도록 수정해야함 (없으면 자동 추정)
+    t_start = time.perf_counter()
     await _check_audio_file(file)
 
-    
     mgr = get_manager()
     if not mgr.is_ready():
         raise HTTPException(status_code=503, detail="모델 로딩 중")
@@ -271,7 +294,8 @@ async def transcribe(
     finally:
         _cleanup(tmp_path)
 
-    return _build_response(result, language, reference)
+    total_elapsed = time.perf_counter() - t_start
+    return _build_response(result, language, reference, total_elapsed_s=total_elapsed)
 
 
 @app.post("/transcribe/async", response_model=JobCreateResponse, tags=["transcribe"])
@@ -316,16 +340,17 @@ async def _run_job(job_id: str, audio_path: str, language: str | None, reference
     job = await job_store.get(job_id)
     if job is None:
         return
-    import time as _t
 
     job.status = JobStatus.PROCESSING
-    job.started_at = _t.time()
+    job.started_at = time.time()
     await job_store.update(job)
 
+    t_start = time.perf_counter()
     try:
         mgr = get_manager()
         result = await mgr.transcribe(audio_path, language=language)
-        response = _build_response(result, language, reference)
+        total_elapsed = time.perf_counter() - t_start
+        response = _build_response(result, language, reference, total_elapsed_s=total_elapsed)
         job.result = response.model_dump()
         job.status = JobStatus.DONE
     except Exception as e:
@@ -333,7 +358,7 @@ async def _run_job(job_id: str, audio_path: str, language: str | None, reference
         job.error = str(e)
         job.status = JobStatus.ERROR
     finally:
-        job.finished_at = _t.time()
+        job.finished_at = time.time()
         _cleanup(audio_path)
         await job_store.update(job)
 
