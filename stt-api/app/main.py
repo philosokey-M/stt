@@ -176,6 +176,19 @@ def _cleanup(path: str | Path) -> None:
         log.warning("임시 파일 삭제 실패 %s: %s", path, e)
 
 
+def _validate_speaker_range(min_speakers: int | None, max_speakers: int | None) -> None:
+    """min_speakers > max_speakers 등 명백히 잘못된 조합은 400 으로 거른다."""
+    if (
+        min_speakers is not None
+        and max_speakers is not None
+        and min_speakers > max_speakers
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=f"min_speakers({min_speakers}) > max_speakers({max_speakers}) 입니다.",
+        )
+
+
 async def _check_audio_file(file: UploadFile) -> None:
     """
     업로드 직후 mutagen 으로 헤더만 검사. 길이가 너무 짧으면 400.
@@ -254,40 +267,66 @@ async def transcribe(
         ),
     ),
     reference: str | None = Form(None, description="정답 텍스트. 제공되면 wer/cer 계산."),
+    diarize: bool | None = Form(
+        None,
+        description=(
+            "화자분리 사용 여부. 미지정 시 서버 기본값(.env DIARIZATION_MODE) 그대로. "
+            "true 로 강제하려면 서버가 화자분리 모델을 로드한 상태여야 함."
+        ),
+    ),
+    min_speakers: int | None = Form(
+        None, ge=1, description="최소 화자 수. 미지정 시 모델 자동 추정."
+    ),
+    max_speakers: int | None = Form(
+        None, ge=1, description="최대 화자 수. 미지정 시 모델 자동 추정."
+    ),
 ):
     """
-    동기 전사. 짧은 오디오에 권장.
-    Returns:
-        dict: 아래와 같은 구조의 STT 결과 딕셔너리를 반환합니다.
-            - segments (list): 오디오를 문장/의미 단위로 분할한 상세 분석 결과 목록
-                - start (float): 해당 구간의 시작 시간 (초 단위)
-                - end (float): 해당 구간의 종료 시간 (초 단위)
-                - text (str): 해당 구간에서 인식된 텍스트 내용
-                - speaker (str): 화자 식별 ID (예: SPEAKER_00)
-            - text (str): 오디오 전체를 텍스트로 변환한 통합 결과
-            - language (str): 오디오에서 감지되거나 지정된 언어 코드 (예: 'ko')
-            - elapsed_s (float): 순수 STT 모델 추론(Inference)에 걸린 시간 (초 단위)
-            - total_elapsed_s (float): 전/후처리를 포함하여 API 요청부터 완료까지의 총 소요 시간 (초 단위)
-            - audio_duration_s (float): 입력된 전체 오디오 파일의 총 길이 (초 단위)
-            - rtf (float): Real-Time Factor (실시간 처리 지수, elapsed_s / audio_duration_s)
-                        (1보다 작을수록 실시간보다 빠르게 처리됨을 의미)
-            - ref (str, optional): 정답 텍스트 (성능 검증/벤치마크 모드가 아닐 경우 null)
-            - hyp (str, optional): 모델 예측 텍스트 (성능 검증/벤치마크 모드가 아닐 경우 null)
-            - wer (float, optional): Word Error Rate (단어 오류율, 성능 검증용 지표)
-            - cer (float, optional): Character Error Rate (문자 오류율, 한국어 STT 주요 평가지표)
+    동기 전사. 짧은 오디오에 권장.\n
+    Returns:\n
+        dict: 아래와 같은 구조의 STT 결과 딕셔너리를 반환합니다.\n
+            - segments (list): 오디오를 문장/의미 단위로 분할한 상세 분석 결과 목록\n 
+                - start (float): 해당 구간의 시작 시간 (초 단위)\n
+                - end (float): 해당 구간의 종료 시간 (초 단위)\n
+                - text (str): 해당 구간에서 인식된 텍스트 내용\n
+                - speaker (str): 화자 식별 ID (예: SPEAKER_00)\n
+            - text (str): 오디오 전체를 텍스트로 변환한 통합 결과\n
+            - language (str): 오디오에서 감지되거나 지정된 언어 코드 (예: 'ko')\n
+            - elapsed_s (float): 순수 STT 모델 추론(Inference)에 걸린 시간 (초 단위)\n
+            - total_elapsed_s (float): 전/후처리를 포함하여 API 요청부터 완료까지의 총 소요 시간 (초 단위)\n
+            - audio_duration_s (float): 입력된 전체 오디오 파일의 총 길이 (초 단위)\n
+            - rtf (float): Real-Time Factor (실시간 처리 지수, elapsed_s / audio_duration_s)\n
+                        (1보다 작을수록 실시간보다 빠르게 처리됨을 의미)\n
+            - ref (str, optional): 정답 텍스트 (성능 검증/벤치마크 모드가 아닐 경우 null)\n
+            - hyp (str, optional): 모델 예측 텍스트 (성능 검증/벤치마크 모드가 아닐 경우 null)\n
+            - wer (float, optional): Word Error Rate (단어 오류율, 성능 검증용 지표)\n
+            - cer (float, optional): Character Error Rate (문자 오류율, 한국어 STT 주요 평가지표)\n
     """
-    # TODO : 화자 최대, 최소 수 파라미터로 제어 하도록 수정해야함 (없으면 자동 추정)
     t_start = time.perf_counter()
     await _check_audio_file(file)
+    _validate_speaker_range(min_speakers, max_speakers)
 
     mgr = get_manager()
     if not mgr.is_ready():
         raise HTTPException(status_code=503, detail="모델 로딩 중")
+    if diarize is True and not mgr.has_diarization():
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "서버에서 화자분리가 비활성화되어 있어 diarize=true 요청을 처리할 수 없습니다. "
+                ".env 의 DIARIZATION_MODE 와 HF_TOKEN 을 설정한 뒤 서버를 재시작하세요."
+            ),
+        )
 
     tmp_path = await _save_upload(file)
     try:
-        # language 가 None 이면 ModelManager → LanguageRouter 가 default 로 채움
-        result = await mgr.transcribe(str(tmp_path), language=language)
+        result = await mgr.transcribe(
+            str(tmp_path),
+            language=language,
+            diarize=diarize,
+            min_speakers=min_speakers,
+            max_speakers=max_speakers,
+        )
     except Exception as e:
         log.exception("transcribe 실패")
         raise HTTPException(status_code=500, detail=f"전사 실패: {e}")
@@ -304,14 +343,25 @@ async def transcribe_async(
     file: UploadFile = File(...),
     language: str | None = Form(None),
     reference: str | None = Form(None),
+    diarize: bool | None = Form(None),
+    min_speakers: int | None = Form(None, ge=1),
+    max_speakers: int | None = Form(None, ge=1),
 ):
     """비동기 전사. 긴 파일에 권장. job_id 를 반환하며 결과는 /jobs/{id} 로 폴링."""
-    # TODO : 화자 최대, 최소 수 파라미터로 제어 하도록 수정해야함 (없으면 자동 추정)
     await _check_audio_file(file)
+    _validate_speaker_range(min_speakers, max_speakers)
 
     mgr = get_manager()
     if not mgr.is_ready():
         raise HTTPException(status_code=503, detail="모델 로딩 중")
+    if diarize is True and not mgr.has_diarization():
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "서버에서 화자분리가 비활성화되어 있어 diarize=true 요청을 처리할 수 없습니다. "
+                ".env 의 DIARIZATION_MODE 와 HF_TOKEN 을 설정한 뒤 서버를 재시작하세요."
+            ),
+        )
 
     tmp_path = await _save_upload(file)
 
@@ -319,7 +369,11 @@ async def transcribe_async(
     job.audio_path = str(tmp_path)
     await job_store.update(job)
 
-    background.add_task(_run_job, job.id, str(tmp_path), language, reference)
+    background.add_task(
+        _run_job,
+        job.id, str(tmp_path), language, reference,
+        diarize, min_speakers, max_speakers,
+    )
 
     return JobCreateResponse(job_id=job.id, status=job.status.value)
 
@@ -336,7 +390,15 @@ async def get_job(job_id: str):
 # --------------------------------------------------------------------------- job worker
 
 
-async def _run_job(job_id: str, audio_path: str, language: str | None, reference: str | None) -> None:
+async def _run_job(
+    job_id: str,
+    audio_path: str,
+    language: str | None,
+    reference: str | None,
+    diarize: bool | None = None,
+    min_speakers: int | None = None,
+    max_speakers: int | None = None,
+) -> None:
     job = await job_store.get(job_id)
     if job is None:
         return
@@ -348,7 +410,13 @@ async def _run_job(job_id: str, audio_path: str, language: str | None, reference
     t_start = time.perf_counter()
     try:
         mgr = get_manager()
-        result = await mgr.transcribe(audio_path, language=language)
+        result = await mgr.transcribe(
+            audio_path,
+            language=language,
+            diarize=diarize,
+            min_speakers=min_speakers,
+            max_speakers=max_speakers,
+        )
         total_elapsed = time.perf_counter() - t_start
         response = _build_response(result, language, reference, total_elapsed_s=total_elapsed)
         job.result = response.model_dump()

@@ -82,11 +82,22 @@ OpenAPI: `http://localhost:$(PORT)/docs`
 
 | Method | Path | 설명 |
 |---|---|---|
-| POST | `/transcribe` | 동기 전사. 짧은 오디오 권장. `file`(필수), `language`(옵션), `reference`(옵션, 주면 wer/cer 계산). |
+| POST | `/transcribe` | 동기 전사. 짧은 오디오 권장. |
 | POST | `/transcribe/async` | 비동기 전사. `job_id` 즉시 반환. |
 | GET  | `/jobs/{job_id}` | job 상태/결과 폴링. |
 | GET  | `/health` | 모델 로드 상태, in-flight 카운트, 캐시된 align 언어, stats. |
 | GET  | `/` | API 메타 정보. |
+
+### `/transcribe`, `/transcribe/async` 폼 필드
+
+| 필드 | 타입 | 설명 |
+|---|---|---|
+| `file` | UploadFile | 필수. wav/mp3/m4a/flac/ogg 등 |
+| `language` | str? | 언어 코드. 미지정 시 서버 default. align 모델은 언어별 lazy load + 캐시 |
+| `reference` | str? | 정답 텍스트. 주면 응답에 `ref/hyp/wer/cer` 포함 |
+| `diarize` | bool? | 화자분리 사용 여부. 미지정 시 서버 default. true 인데 서버가 diarizer 미로드면 400 |
+| `min_speakers` | int? | 최소 화자 수. 미지정 시 모델 자동 추정 |
+| `max_speakers` | int? | 최대 화자 수. min>max 면 400 |
 
 응답 스키마는 `app/schemas.py::TranscribeResponse` 참고. `/results/benchmark_*.json`
 의 record 와 같은 키 (`segments[*].{start,end,text,speaker}`, `wer/cer/rtf/elapsed_s`)
@@ -111,25 +122,34 @@ OpenAPI: `http://localhost:$(PORT)/docs`
 확장이 필요해지면 `app/inference.py::ModelManager` 에 micro-batching 워커 추가가
 가장 깔끔한 진입점. 외부 인터페이스(`transcribe()`) 는 유지 가능.
 
-### LanguageRouter — 런타임 언어 스위칭 (단일 모델)
+### LanguageRouter — 요청별 파이프라인 오버라이드 (단일 모델)
 
-`app/language_router.py`.
+`app/language_router.py`. 이름은 "Language" 지만 실제로는 **언어 + 화자분리** 모두
+요청 단위로 swap 한다.
 
 **제약**: 사용자 요청 — 메모리 부족, 그래서 언어당 모델 하나씩 띄울 수 없음.
 **제약**: `/whisperx` 수정 금지.
 
-**해결**:
+**언어 처리**:
 - Whisper 모델 본체(`large-v3` 등)는 원래 다국어 → 그대로 공유.
 - 각 요청 직전에 `stt._language` 를 monkey-patch 하고, 끝나면 복원.
 - WhisperX 의 `_align_model`/`_align_metadata` 는 언어 전용 (Wav2Vec2, 약 300MB).
   → 사용된 언어별로 lazy load 해서 `_align_cache` 에 캐시.
-- swap-run-restore 는 `threading.Lock` 으로 원자화. 동시 요청은 자연히 직렬화.
 - 백엔드 판별은 duck typing (`hasattr(stt, "_align_model")`).
 - align 모델 로드 실패하는 언어는 align 만 자동 skip + 경고 로그.
 - transformers 백엔드는 `_pipe._forward_params["language"]` / `generate_kwargs`
   패치를 best-effort 로 시도.
 
-`/health` 응답의 `cached_align_languages` 로 현재 캐시 상태 확인 가능.
+**화자분리 처리** (`_swap_diarization_in`):
+- 요청에서 `diarize=False` → 이 요청만 `pipeline.diarizer = None` 으로 swap.
+- 요청에서 `diarize=True` 인데 서버 startup 시 diarizer 미로드 → 명시적 에러.
+  (서버에 없는 모델은 요청으로 못 켬 — `.env` 의 `DIARIZATION_MODE` + `HF_TOKEN`
+  설정 후 재시작 필요)
+- `min_speakers`/`max_speakers` 가 주어지면 `diarizer._min_speakers`/`_max_speakers`
+  를 swap.
+
+**원자성**: 모든 swap-run-restore 는 같은 `threading.Lock` 으로 묶임. 동시 요청은
+자연히 직렬화. `/health` 응답의 `cached_align_languages` 로 캐시 상태 확인.
 
 ### 설정
 
@@ -141,6 +161,18 @@ OpenAPI: `http://localhost:$(PORT)/docs`
   - `auto` (기본): 토큰 있으면 ON, 없으면 OFF — 시작 실패 없음.
   - `on`: 토큰 없으면 startup 시 RuntimeError.
   - `off`: 강제 OFF, `segments[*].speaker == null`.
+  - 서버 startup 의 ON/OFF 는 *이 모델이 로드되어 있는가* 를 결정하고,
+    요청 단위 `diarize` 폼 필드는 *이 요청에서 사용할지* 를 결정한다.
+
+### HF 캐시 모드 (HF_OFFLINE)
+
+- `HF_OFFLINE=true` (**기본**): startup 시 `HF_HUB_OFFLINE=1` +
+  `TRANSFORMERS_OFFLINE=1` 강제. **폐쇄망 동작**, **모델 버전 불시 변경 위험 0**.
+- `HF_OFFLINE=false`: HF 서버 통신 허용. 새 모델 다운로드 / etag 체크 가능.
+- 운영 패턴: 새 모델은 일시적으로 `false` 로 받은 뒤 다시 `true` 로 잠근다.
+- 구현: `app/settings.py::_apply_hf_offline()` — `load_settings()` 가장 첫 단계에서
+  실행되므로 HF 라이브러리 임포트 전에 환경변수가 박힘 (whisperx/pyannote 모두
+  __init__ 에서 lazy import 라 안전).
 
 ### 응답 포맷
 
@@ -202,3 +234,11 @@ STT 자체(`whisperx`, `faster-whisper`, `pyannote`, `torch` …)는 conda env `
   align 모델 캐시. /whisperx 무수정.
 - 설정 단일화: `config.yaml` 삭제 → `.env` 만으로 모든 설정 표현.
 - 방어: `_env()` strip, .env 인라인 코멘트 금지 가이드라인.
+- 업로드 안정화: `_check_audio_file` 이 스트림을 소비하던 버그 수정 (seek(0) 복구),
+  `_save_upload` 를 `shutil.copyfileobj` 로 단순화, 0-byte/초과 가드.
+- 응답: `total_elapsed_s` 추가 (엔드포인트 진입 → 응답 직전, 사용자 체감 시간).
+- 검증 비용: `_check_audio_file` 이 SpooledTemporaryFile 을 mutagen 에 직접 넘김
+  (RAM 200MB → 수 KB).
+- 요청별 파라미터: `diarize`, `min_speakers`, `max_speakers` 폼 필드 추가.
+  `LanguageRouter` 가 같은 락 안에서 함께 swap.
+- HF 캐시 잠금: `HF_OFFLINE=true` 기본화. 폐쇄망 / 모델 버전 안정성 우선.

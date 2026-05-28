@@ -136,7 +136,34 @@ def _resolve_diarization(cfg: dict, mode: str) -> None:
         diar["enabled"] = has_token
 
 
+def _apply_hf_offline() -> bool:
+    """
+    HF_OFFLINE=true (기본) 일 때 HuggingFace 캐시 전용 모드로 강제.
+
+    중요: 이 함수는 whisperx / pyannote / transformers 가 임포트되기 *전에*
+    호출돼야 효과가 있다. 본 모듈(settings.py)은 main.py 에서 가장 먼저 SETTINGS 를
+    참조하기 때문에 자연스럽게 보장된다 (HF 라이브러리는 model load 시점에 lazy
+    import).
+
+    효과:
+      HF_HUB_OFFLINE=1       — huggingface_hub 가 네트워크 호출 안 함, 캐시만 사용.
+      TRANSFORMERS_OFFLINE=1 — transformers 도 동일.
+    """
+    offline = _env_bool("HF_OFFLINE", True)
+    if offline:
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        os.environ["TRANSFORMERS_OFFLINE"] = "1"
+    else:
+        # 명시적으로 false 면 혹시 외부에서 세팅돼 있어도 제거 (덮어쓰기 방지 X)
+        os.environ.pop("HF_HUB_OFFLINE", None)
+        os.environ.pop("TRANSFORMERS_OFFLINE", None)
+    return offline
+
+
 def load_settings() -> APISettings:
+    # HF 오프라인 모드를 *가장 먼저* 적용 — HF 라이브러리 임포트 전에 환경변수가 박혀야 함.
+    _apply_hf_offline()
+
     cfg = _build_pipeline_config()
 
     diarization_mode = (_env("DIARIZATION_MODE", "auto") or "auto").lower()

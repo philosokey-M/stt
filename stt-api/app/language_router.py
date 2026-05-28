@@ -1,12 +1,14 @@
 """
-요청별 언어 라우팅 — /whisperx 코드를 수정하지 않고 단일 파이프라인에서
-다국어를 지원하기 위한 어댑터.
+요청별 파이프라인 오버라이드 — /whisperx 코드를 수정하지 않고 단일 파이프라인
+인스턴스에서 요청마다 다른 언어 / 화자분리 설정을 적용하기 위한 어댑터.
 
 핵심 아이디어:
 - Whisper 모델 본체(large-v3 등)는 원래 다국어다. transcribe() 가 언어 파라미터를
   받기 때문에 model._language 만 바꿔치기하면 같은 모델이 다른 언어로 동작한다.
 - WhisperX 의 align 모델만 언어 전용(Wav2Vec2 계열, 약 300MB). 요청된 언어별로
   lazy load + 캐시한다 → 첫 요청은 약간 느리고, 이후는 즉시.
+- 화자분리는 pipeline.diarizer 자체를 일시적으로 None 으로 만들거나, 화자 수
+  min/max 를 diarizer 내부 속성으로 swap 한다.
 - 같은 모델 객체의 속성을 일시적으로 바꿔치기하므로 swap-transcribe-restore
   과정을 threading.Lock 으로 원자화한다 → 동시 요청은 자연히 직렬화된다.
 
@@ -15,6 +17,7 @@
 - FasterWhisperSTT  : 언어 swap (모델은 어차피 다국어, align 없음)
 - TransformersSTT   : 베스트-에포트. 파이프라인의 generate_kwargs 까지 patch 시도.
                       실패 시 init 언어로만 동작 — 경고 로그.
+- PyannotesDiarizer : 요청별 on/off + min/max speakers 오버라이드.
 """
 
 from __future__ import annotations
@@ -59,26 +62,46 @@ class LanguageRouter:
     # ------------------------------------------------------------------ public
 
     @contextmanager
-    def use(self, language: str | None):
+    def use(
+        self,
+        language: str | None,
+        diarize: bool | None = None,
+        min_speakers: int | None = None,
+        max_speakers: int | None = None,
+    ):
         """
-        with router.use("en"):
+        with router.use("en", diarize=True, min_speakers=2, max_speakers=2):
             result = pipeline.run(audio_path)
 
-        진입 직전에 stt 객체의 언어/align 모델을 바꾸고, finally 에서 원복.
+        진입 직전에 stt/diarizer 객체의 설정을 바꾸고, finally 에서 원복.
         lock 보유 중에는 다른 요청이 같은 모델을 호출하지 못한다.
+
+        파라미터:
+            language     : None → 서버 default 사용.
+            diarize      : None → pipeline 의 현재 diarizer 유무 그대로 사용.
+                           True → diarizer 사용 (없으면 RuntimeError).
+                           False → 이 요청만 diarization skip.
+            min_speakers : None → diarizer 기본값 / 자동 추정.
+                           int  → 이 요청만 해당 값으로 강제.
+            max_speakers : 동일.
         """
         if not language:
             language = self._default_language
 
         with self._lock:
             saved = self._swap_in(language)
+            diar_saved = self._swap_diarization_in(diarize, min_speakers, max_speakers)
             try:
                 yield language
             finally:
+                self._swap_diarization_out(diar_saved)
                 self._swap_out(saved)
 
     def cached_languages(self) -> list[str]:
         return sorted(self._align_cache.keys())
+
+    def has_diarization(self) -> bool:
+        return self._pipeline.diarizer is not None
 
     # ------------------------------------------------------------------ internal
 
@@ -142,6 +165,55 @@ class LanguageRouter:
         m, meta = whisperx.load_align_model(language_code=language, device=self._device)
         self._align_cache[language] = (m, meta)
         return m, meta
+
+    # ------------------------------------------------------------------ diarization
+
+    def _swap_diarization_in(
+        self,
+        diarize: bool | None,
+        min_speakers: int | None,
+        max_speakers: int | None,
+    ) -> dict[str, Any]:
+        """요청 단위로 pipeline.diarizer 와 그 내부 화자 수 한계를 바꿔둔다."""
+        saved: dict[str, Any] = {}
+        diarizer = self._pipeline.diarizer
+
+        # diarize=True 인데 서버에 diarizer 가 없으면 명시적 에러
+        if diarize is True and diarizer is None:
+            raise RuntimeError(
+                "서버에서 화자분리가 비활성화되어 있습니다. "
+                ".env 의 DIARIZATION_MODE 를 auto/on 으로 두고 HF_TOKEN 을 설정한 뒤 "
+                "서버를 재시작하세요."
+            )
+
+        # diarize=False → 이 요청만 diarizer 끄기
+        if diarize is False and diarizer is not None:
+            saved["pipeline.diarizer"] = diarizer
+            self._pipeline.diarizer = None
+            return saved  # diarizer 가 꺼졌으니 min/max 적용 의미 없음
+
+        # 화자 수 오버라이드 — diarizer 가 살아있을 때만 의미 있음
+        if diarizer is not None:
+            if min_speakers is not None and hasattr(diarizer, "_min_speakers"):
+                saved["diarizer._min_speakers"] = diarizer._min_speakers
+                diarizer._min_speakers = min_speakers
+            if max_speakers is not None and hasattr(diarizer, "_max_speakers"):
+                saved["diarizer._max_speakers"] = diarizer._max_speakers
+                diarizer._max_speakers = max_speakers
+
+        return saved
+
+    def _swap_diarization_out(self, saved: dict[str, Any]) -> None:
+        if "pipeline.diarizer" in saved:
+            self._pipeline.diarizer = saved["pipeline.diarizer"]
+        diarizer = self._pipeline.diarizer
+        if diarizer is not None:
+            if "diarizer._min_speakers" in saved:
+                diarizer._min_speakers = saved["diarizer._min_speakers"]
+            if "diarizer._max_speakers" in saved:
+                diarizer._max_speakers = saved["diarizer._max_speakers"]
+
+    # ------------------------------------------------------------------ transformers helper
 
     def _patch_transformers_language(
         self,

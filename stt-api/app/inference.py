@@ -19,7 +19,7 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-from .audio import audio_duration_seconds, decode_audio
+from .audio import audio_duration_seconds
 from .language_router import LanguageRouter
 from .pipeline_adapter import Pipeline, build_from_config
 from .settings import APISettings
@@ -101,10 +101,13 @@ class ModelManager:
         self,
         audio_path: str,
         language: str | None = None,
+        diarize: bool | None = None,
+        min_speakers: int | None = None,
+        max_speakers: int | None = None,
     ) -> TranscribeResult:
         """
-        요청별 language 를 받아 LanguageRouter 가 stt 객체의 언어/align 모델을
-        일시적으로 바꾼다. /whisperx 코드는 수정하지 않는다.
+        요청별 language / 화자분리 설정을 받아 LanguageRouter 가 파이프라인의 stt/
+        diarizer 속성을 일시적으로 바꾼다. /whisperx 코드는 수정하지 않는다.
 
         first-call-of-language: 해당 언어의 align 모델 (~300MB) 다운로드/로드 비용.
         cached: 즉시 사용.
@@ -122,7 +125,8 @@ class ModelManager:
             t0 = time.perf_counter()
             try:
                 result, used_language = await asyncio.to_thread(
-                    self._transcribe_with_language, audio_path, language
+                    self._transcribe_with_overrides,
+                    audio_path, language, diarize, min_speakers, max_speakers,
                 )
             except Exception:
                 self._stats["errors"] += 1
@@ -139,16 +143,29 @@ class ModelManager:
             language=used_language,
         )
 
-    def _transcribe_with_language(
+    def _transcribe_with_overrides(
         self,
         audio_path: str,
         language: str | None,
+        diarize: bool | None,
+        min_speakers: int | None,
+        max_speakers: int | None,
     ) -> tuple[dict, str]:
         """워커 스레드에서 실행되는 동기 경로 — 락 + monkey-patch + run."""
         assert self._router is not None
-        with self._router.use(language) as used_lang:
+        with self._router.use(
+            language,
+            diarize=diarize,
+            min_speakers=min_speakers,
+            max_speakers=max_speakers,
+        ) as used_lang:
             result = self._pipeline.run(audio_path)  # type: ignore[union-attr]
         return result, used_lang
+
+    # ---------------------------------------------------------- queries
+
+    def has_diarization(self) -> bool:
+        return self._router is not None and self._router.has_diarization()
 
     # ---------------------------------------------------------- helpers
 
