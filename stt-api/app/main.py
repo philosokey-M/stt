@@ -175,22 +175,32 @@ def _cleanup(path: str | Path) -> None:
 
 async def _check_audio_file(file: UploadFile) -> None:
     """
-    업로드 직후 mutagen 으로 헤더 검사. 길이가 너무 짧으면 400.
+    업로드 직후 mutagen 으로 헤더만 검사. 길이가 너무 짧으면 400.
 
-    중요: file.read() 가 업로드 스트림을 끝까지 소비하므로, 검사 후 반드시
-    file.seek(0) 으로 되돌려놔야 이후 _save_upload() 가 정상 동작한다.
+    SpooledTemporaryFile 객체를 mutagen 에 직접 넘겨 헤더 부근만 seek/read 한다.
+    전체 본문을 RAM 에 올리지 않으므로 200MB 업로드여도 실제 RAM 사용은 수 KB.
+    검사 전후로 파일 포인터를 0 으로 맞춰 이후 _save_upload() 가 정상 동작하게 한다.
+
+    실제 I/O 는 sync 라 asyncio.to_thread 로 워커 스레드 위임 → 이벤트 루프 미블로킹.
     """
-    import io
     import mutagen
 
-    file_bytes = await file.read()
+    def _validate_sync(spooled):
+        spooled.seek(0)
+        try:
+            return mutagen.File(spooled)
+        finally:
+            spooled.seek(0)
+
     try:
-        audio = mutagen.File(io.BytesIO(file_bytes))
+        audio = await asyncio.to_thread(_validate_sync, file.file)
     except Exception as e:
+        # 안전을 위해 포인터도 복구 시도
+        try:
+            await file.seek(0)
+        except Exception:
+            pass
         raise HTTPException(status_code=400, detail=f"오디오 헤더 파싱 실패: {e}")
-    finally:
-        # HTTPException 발생 여부와 무관하게 파일 포인터 복구.
-        await file.seek(0)
 
     if audio is None or audio.info is None:
         raise HTTPException(status_code=400, detail="지원하지 않거나 손상된 오디오 파일입니다.")
