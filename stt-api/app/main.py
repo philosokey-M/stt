@@ -14,9 +14,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import shutil
 import tempfile
-import mutagen
-import io
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -115,28 +114,55 @@ def _build_response(
 
 
 async def _save_upload(file: UploadFile) -> Path:
+    """
+    업로드된 파일을 /tmp 에 저장. UploadFile.file (SpooledTemporaryFile) 의 위치를
+    명시적으로 0 으로 되돌리고, shutil.copyfileobj 로 한 번에 복사 — 청크 루프보다
+    덜 미묘하고 더 안정적이다.
+
+    빈 파일(0 bytes)이면 400 으로 즉시 반환한다.
+    """
     max_bytes = SETTINGS.server.max_upload_mb * 1024 * 1024
     suffix = Path(file.filename or "audio").suffix or ".bin"
     fd, tmp_path = tempfile.mkstemp(prefix="stt_", suffix=suffix)
     os.close(fd)
 
-    total = 0
-    try:
+    def _copy_sync() -> int:
+        # 어떤 이유로든 파일 포인터가 끝에 가있는 경우를 방어
+        try:
+            file.file.seek(0)
+        except Exception:
+            pass
         with open(tmp_path, "wb") as out:
-            while True:
-                chunk = await file.read(1024 * 1024)
-                if not chunk:
-                    break
-                total += len(chunk)
-                if total > max_bytes:
-                    raise HTTPException(
-                        status_code=413,
-                        detail=f"파일이 너무 큽니다. 최대 {SETTINGS.server.max_upload_mb}MB",
-                    )
-                out.write(chunk)
+            shutil.copyfileobj(file.file, out, length=1024 * 1024)
+        return os.path.getsize(tmp_path)
+
+    try:
+        size = await asyncio.to_thread(_copy_sync)
     except Exception:
         Path(tmp_path).unlink(missing_ok=True)
         raise
+
+    log.info(
+        "업로드 저장: name=%r content_type=%s size=%d → %s",
+        file.filename, file.content_type, size, tmp_path,
+    )
+
+    if size == 0:
+        Path(tmp_path).unlink(missing_ok=True)
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"업로드된 파일이 비어있습니다 (filename={file.filename!r}). "
+                "multipart 폼 필드 이름이 'file' 인지, 파일 경로가 올바른지 확인하세요."
+            ),
+        )
+    if size > max_bytes:
+        Path(tmp_path).unlink(missing_ok=True)
+        raise HTTPException(
+            status_code=413,
+            detail=f"파일이 너무 큽니다 ({size} bytes). 최대 {SETTINGS.server.max_upload_mb}MB",
+        )
+
     return Path(tmp_path)
 
 
@@ -148,18 +174,33 @@ def _cleanup(path: str | Path) -> None:
 
 
 async def _check_audio_file(file: UploadFile) -> None:
+    """
+    업로드 직후 mutagen 으로 헤더 검사. 길이가 너무 짧으면 400.
+
+    중요: file.read() 가 업로드 스트림을 끝까지 소비하므로, 검사 후 반드시
+    file.seek(0) 으로 되돌려놔야 이후 _save_upload() 가 정상 동작한다.
+    """
+    import io
+    import mutagen
+
     file_bytes = await file.read()
     try:
-        audio_file = io.BytesIO(file_bytes)
-        audio = mutagen.File(audio_file)
-        if audio is None or audio.info is None:
-            raise HTTPException(status_code=400, detail="지원하지 않거나 손상된 오디오 파일입니다.")
-        duration = audio.info.length
-        if duration < SETTINGS.server.min_audio_duration_s:
-            raise HTTPException(status_code=400, detail=f"오디오 파일 길이가 너무 짧습니다. 최소 {SETTINGS.server.min_audio_duration_s}초")
-        
+        audio = mutagen.File(io.BytesIO(file_bytes))
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"오류 발생: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"오디오 헤더 파싱 실패: {e}")
+    finally:
+        # HTTPException 발생 여부와 무관하게 파일 포인터 복구.
+        await file.seek(0)
+
+    if audio is None or audio.info is None:
+        raise HTTPException(status_code=400, detail="지원하지 않거나 손상된 오디오 파일입니다.")
+
+    duration = audio.info.length
+    if duration < SETTINGS.server.min_audio_duration_s:
+        raise HTTPException(
+            status_code=400,
+            detail=f"오디오 파일 길이가 너무 짧습니다. 최소 {SETTINGS.server.min_audio_duration_s}초",
+        )
 
 # --------------------------------------------------------------------------- endpoints
 
