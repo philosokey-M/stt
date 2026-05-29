@@ -17,6 +17,11 @@
    새 STT/VAD/화자분리 모델이 필요하면 `/whisperx/stages/*.py` 에 클래스를
    추가하고 `/stt-api` 는 그대로 인식되게 한다. /whisperx 수정이 정말로 필요하면
    사용자에게 먼저 확인.
+   - **현재 승인된 예외**: `stages/diarizer.py::PyannotesDiarizer.__init__` 와
+     `stages/vad.py::PyannoteVAD.__init__` 에 GPU 이동 코드 추가됨. pyannote 의
+     `Pipeline.from_pretrained()` 가 device 인자를 받지 않아 CPU 에서 돌던 문제를
+     해결. `cfg.get("device", "cuda")` 를 읽어 `pipeline.to(torch.device("cuda"))`
+     호출. 다른 변경은 여전히 금지.
 2. **Python 환경은 conda env `stt`**.
    인터프리터 절대경로: `/home/hong/miniconda3/envs/stt/bin/python`.
    Makefile 도 이걸 가리킨다. `conda activate stt` 가 안 되는 비대화형 셸에서도
@@ -242,3 +247,6 @@ STT 자체(`whisperx`, `faster-whisper`, `pyannote`, `torch` …)는 conda env `
 - 요청별 파라미터: `diarize`, `min_speakers`, `max_speakers` 폼 필드 추가.
   `LanguageRouter` 가 같은 락 안에서 함께 swap.
 - HF 캐시 잠금: `HF_OFFLINE=true` 기본화. 폐쇄망 / 모델 버전 안정성 우선.
+- GPU 일관성: pyannote(VAD/diarization) 가 CPU 에서 돌던 버그 수정.
+  `/whisperx/stages/diarizer.py`, `vad.py` 에 `.to(cuda)` 추가 (승인된 예외).
+  `settings.py` 가 `DEVICE` 를 vad/stt/diarization 세 섹션에 모두 전파.

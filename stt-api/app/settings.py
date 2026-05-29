@@ -79,12 +79,17 @@ def _build_pipeline_config() -> dict[str, Any]:
     """
     /whisperx/pipeline.py 의 build_from_config() 가 받는 dict 를 .env 만으로 구성.
     /whisperx 의 스키마를 그대로 따라 만든다.
+
+    device 는 STT 뿐 아니라 vad / diarization 섹션에도 넣어 전 단계 일관성 유지
+    (pyannote 모델들이 자기 cfg 의 device 를 읽어 GPU 로 이동).
     """
+    device = _env("DEVICE", "cuda")
     return {
         "pipeline": {
             "vad": {
                 "model": _env("VAD_MODEL", "disabled"),
                 "model_id": _env("VAD_MODEL_ID", "pyannote/voice-activity-detection"),
+                "device": device,
                 # silero 전용 — 기본값은 stages/vad.py 와 동일
                 "onset": _env_float("VAD_ONSET", 0.500),
                 "offset": _env_float("VAD_OFFSET", 0.363),
@@ -95,7 +100,7 @@ def _build_pipeline_config() -> dict[str, Any]:
                 "backend": _env("STT_BACKEND", "whisperx"),
                 "model_id": _env("STT_MODEL_ID", "large-v3"),
                 "language": _env("DEFAULT_LANGUAGE", "ko"),
-                "device": _env("DEVICE", "cuda"),
+                "device": device,
                 "compute_type": _env("COMPUTE_TYPE", "float16"),
                 "batch_size": _env_int("BATCH_SIZE", 16),
                 "align": _env_bool("ALIGN", True),
@@ -110,6 +115,7 @@ def _build_pipeline_config() -> dict[str, Any]:
                     "DIARIZATION_MODEL_ID",
                     "pyannote/speaker-diarization-3.1",
                 ),
+                "device": device,
                 "min_speakers": _env_int_optional("DIAR_MIN_SPEAKERS"),
                 "max_speakers": _env_int_optional("DIAR_MAX_SPEAKERS"),
             },

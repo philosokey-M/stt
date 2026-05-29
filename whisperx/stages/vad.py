@@ -51,6 +51,14 @@ class PyannoteVAD(VADBase):
         token = cfg.get("hf_token") or os.environ.get("HF_TOKEN")
         self._pipeline = Pipeline.from_pretrained(model_id, token=token)
 
+        # pyannote.audio.Pipeline.from_pretrained() 은 device 인자를 받지 않으므로
+        # 로드 후 명시적으로 옮긴다. cfg.device 가 없으면 cuda 가 기본.
+        device = cfg.get("device", "cuda")
+        if device == "cuda":
+            import torch
+            if torch.cuda.is_available():
+                self._pipeline.to(torch.device("cuda"))
+
     def detect(self, audio: np.ndarray) -> list[dict]:
         import torch
 
