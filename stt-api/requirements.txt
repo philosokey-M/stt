@@ -5,7 +5,10 @@ pydantic>=2.6
 python-dotenv>=1.0
 numpy
 soundfile
+mutagen                           # _check_audio_file() 의 헤더 검사
 
-# STT engines (whisperx 폴더와 동일 — 이미 설치되어 있다면 재설치되지 않음)
+# STT engines (conda env "stt" 에는 이미 있고, Docker 이미지엔 여기서 설치됨)
 whisperx
 faster-whisper
+# pyannote.audio 는 whisperx 의 transitive dep 라 자동 설치되지만, 명시해서 잠금.
+pyannote.audio

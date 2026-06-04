@@ -1,0 +1,59 @@
+# =====================================================================
+# stt-api 운영용 docker compose
+# 사용:
+#   cd stt-api
+#   docker compose up -d --build       # 빌드 + 백그라운드 기동
+#   docker compose logs -f stt-api     # 로그 추적
+#   docker compose down                # 정지 + 컨테이너 제거 (볼륨은 유지)
+#
+# GPU 요구: NVIDIA Container Toolkit 설치된 호스트.
+# CPU 전용 운영: services.stt-api.deploy 블록을 주석 처리하고 .env 에서 DEVICE=cpu.
+# =====================================================================
+
+services:
+  stt-api:
+    build:
+      context: ..                # 프로젝트 루트 — stt-api 의 부모. /whisperx 도 함께 COPY.
+      dockerfile: stt-api/Dockerfile
+    image: stt-api:latest
+    container_name: stt-api
+    restart: unless-stopped
+
+    # .env 파일을 컨테이너 환경변수로 주입
+    env_file:
+      - .env
+
+    ports:
+      # 호스트:컨테이너. PORT 가 .env 에 있으면 그 값을 호스트 쪽에 매핑.
+      - "${PORT:-8000}:8000"
+
+    volumes:
+      # HuggingFace 모델 캐시 — 컨테이너 재시작/재빌드해도 모델 다시 다운로드 안 함.
+      - hf_cache:/root/.cache/huggingface
+      # (선택) 호스트에서 직접 확인하고 싶다면 named volume 대신 bind mount 사용
+      # - ./.cache/huggingface:/root/.cache/huggingface
+
+    # PyTorch DataLoader / pyannote 등이 /dev/shm 을 씀. 기본 64MB 는 부족할 수 있어 키움.
+    shm_size: "2gb"
+
+    # NVIDIA GPU 마운트 (docker compose v2.3+ + NVIDIA Container Toolkit 필요)
+    # CPU 만 쓰려면 이 블록 삭제/주석.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+    # 로깅 — 로그가 무한히 쌓이지 않도록 회전
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+volumes:
+  # named volume — `docker compose down -v` 하면 같이 제거되니 모델 캐시 날아감 주의
+  hf_cache:
+    driver: local

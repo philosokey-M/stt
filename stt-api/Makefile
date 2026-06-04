@@ -16,7 +16,8 @@ include .env
 export
 endif
 
-.PHONY: help install env run dev test health curl-transcribe lint clean
+.PHONY: help install env run dev test health curl-transcribe lint clean \
+        docker-build docker-up docker-down docker-restart docker-logs docker-shell docker-warmup
 
 help:
 	@echo ""
@@ -33,6 +34,15 @@ help:
 	@echo ""
 	@echo "  make test            pytest 실행"
 	@echo "  make clean           __pycache__ 정리"
+	@echo ""
+	@echo "  --- Docker (운영) ---"
+	@echo "  make docker-build    이미지 빌드 (캐시 활용)"
+	@echo "  make docker-up       백그라운드 기동 (모델은 hf_cache 볼륨에 영속)"
+	@echo "  make docker-down     컨테이너 정지/제거 (볼륨은 유지)"
+	@echo "  make docker-restart  컨테이너 재시작 (.env 변경 반영)"
+	@echo "  make docker-logs     stt-api 로그 추적"
+	@echo "  make docker-shell    컨테이너 안에 bash"
+	@echo "  make docker-warmup   첫 셋업용: HF_OFFLINE=false 로 모델 다운로드 후 종료"
 	@echo ""
 
 install:
@@ -71,7 +81,7 @@ curl-transcribe:
 		exit 1; \
 	fi
 	curl -sf -X POST http://$(HOST):$(PORT)/transcribe \
-		-F "file=@$(AUDIO)" \
+		-F "audio=@$(AUDIO)" \
 		-F "language=$(or $(LANG_CODE),ko)" | python -m json.tool
 
 test:
@@ -80,3 +90,37 @@ test:
 clean:
 	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
 	find . -type d -name .pytest_cache -exec rm -rf {} + 2>/dev/null || true
+
+
+# ============================================================
+#   Docker 운영
+# ============================================================
+DC ?= docker compose
+
+docker-build:
+	$(DC) build
+
+docker-up:
+	$(DC) up -d
+	@echo ""
+	@echo "기동 중. 모델 로드 완료될 때까지 'make docker-logs' 로 확인하세요."
+	@echo "준비 완료 후:  curl http://localhost:$(PORT)/health"
+
+docker-down:
+	$(DC) down
+
+docker-restart:
+	$(DC) restart stt-api
+
+docker-logs:
+	$(DC) logs -f stt-api
+
+docker-shell:
+	$(DC) exec stt-api /bin/bash
+
+# 최초 셋업: HF_OFFLINE=false 로 일회성 실행해 모델 캐시 채우고 빠져나옴.
+# 이후엔 .env 의 HF_OFFLINE=true (기본) 그대로 두고 docker-up 만 하면 됨.
+docker-warmup:
+	@echo "[warmup] HF_OFFLINE=false 로 모델 다운로드 시작 — HF_TOKEN 이 필요할 수 있음"
+	$(DC) run --rm -e HF_OFFLINE=false stt-api \
+		python -c "from app.settings import SETTINGS; from app.inference import init_manager; init_manager(SETTINGS); print('[warmup] 모델 캐시 준비 완료')"

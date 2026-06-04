@@ -4,6 +4,7 @@ FastAPI 엔트리포인트.
 엔드포인트:
   POST /transcribe          — 동기 전사. 결과 JSON 즉시 반환.
   POST /transcribe/async    — 비동기 전사. job_id 반환.
+  GET  /progress/{task_id}  — 진행률 조회. (동기/비동기 모두 사용 가능)
   GET  /jobs/{job_id}       — 비동기 job 상태/결과 조회.
   GET  /health              — 모델 로드 상태/통계.
   GET  /                    — API 정보.
@@ -16,6 +17,7 @@ import logging
 import os
 import shutil
 import tempfile
+import threading
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -31,9 +33,11 @@ from fastapi import (
 )
 from fastapi.responses import JSONResponse
 
+from .audio import audio_duration_seconds
 from .inference import ModelManager, TranscribeResult, get_manager, init_manager
 from .jobs import Job, JobStatus, JobStore, sweeper_loop
 from .metrics import cer, normalize_hypothesis, normalize_label, wer
+from .progress import get_progress, mark_done, simulate_progress
 from .schemas import (
     HealthResponse,
     JobCreateResponse,
@@ -92,7 +96,17 @@ def _build_response(
 ) -> TranscribeResponse:
     full_text = " ".join(s["text"] for s in result.segments).strip()
 
+    # 레거시 호환 chunks 포맷: segments 와 같은 데이터, 키 이름만 다름.
+    chunks = [
+        {"text": s["text"], "start_time": s["start"], "end_time": s["end"]}
+        for s in result.segments
+    ]
+
     payload: dict = {
+        # 레거시 호환 필드 (외부 클라이언트가 의존)
+        "chunks": chunks,
+        "duration": result.audio_duration_s,
+        # 확장 필드
         "segments": result.segments,
         "text": full_text,
         # router 가 실제로 사용한 언어를 그대로 노출 (요청 미지정 시 default)
@@ -189,6 +203,47 @@ def _validate_speaker_range(min_speakers: int | None, max_speakers: int | None) 
         )
 
 
+async def _start_progress_simulator(
+    task_id: str | None,
+    tmp_path: Path,
+) -> tuple[threading.Thread | None, threading.Event]:
+    """
+    task_id 가 주어진 경우 진행률 시뮬레이터 스레드를 시작.
+    반환: (스레드, stop_event). 호출자는 finally 에서 _stop_progress_simulator 로 정리.
+
+    실제 진행률은 알 수 없어서 audio_duration * EXPECTED_RTF 기반으로 시간 추정.
+    """
+    stop_event = threading.Event()
+    if not task_id:
+        return None, stop_event
+
+    try:
+        audio_dur = await asyncio.to_thread(audio_duration_seconds, str(tmp_path), None)
+    except Exception:
+        audio_dur = 0.0
+
+    thread = threading.Thread(
+        target=simulate_progress,
+        args=(task_id, audio_dur, SETTINGS.server.expected_rtf, stop_event),
+        daemon=True,
+    )
+    thread.start()
+    return thread, stop_event
+
+
+def _stop_progress_simulator(
+    task_id: str | None,
+    thread: threading.Thread | None,
+    stop_event: threading.Event,
+) -> None:
+    """시뮬레이터 종료 + 진행률 1.0 표시 (TTL 후 자동 정리)."""
+    stop_event.set()
+    if thread is not None:
+        thread.join(timeout=5)
+    if task_id:
+        mark_done(task_id)
+
+
 async def _check_audio_file(file: UploadFile) -> None:
     """
     업로드 직후 mutagen 으로 헤더만 검사. 길이가 너무 짧으면 400.
@@ -240,6 +295,7 @@ def root():
             "POST /transcribe",
             "POST /transcribe/async",
             "GET  /jobs/{job_id}",
+            "GET  /progress/{task_id}",
             "GET  /health",
             "GET  /docs",
         ],
@@ -257,13 +313,20 @@ def health():
 
 @app.post("/transcribe", response_model=TranscribeResponse, tags=["transcribe"])
 async def transcribe(
-    file: UploadFile = File(..., description="오디오 파일 (wav/mp3/m4a/flac/ogg 등)"),
+    audio: UploadFile = File(..., description="오디오 파일 (wav/mp3/m4a/flac/ogg 등). 폼 필드명은 'audio'."),
     language: str | None = Form(
         None,
         description=(
             "언어 코드 (ko, en, ja, zh, fr, de, ...). 미지정 시 서버 기본값 사용. "
             "Whisper 가 지원하는 언어면 동일 모델에서 처리. 해당 언어의 align 모델은 "
             "첫 요청에서 자동 로드 + 캐시 (약 300MB)."
+        ),
+    ),
+    task_id: str | None = Form(
+        None,
+        description=(
+            "외부 큐(Celery 등)가 발행한 task ID. 주면 GET /progress/{task_id} 로 "
+            "진행률 폴링 가능. 진행률은 오디오 길이 × EXPECTED_RTF 로 추정한 값."
         ),
     ),
     reference: str | None = Form(None, description="정답 텍스트. 제공되면 wer/cer 계산."),
@@ -282,28 +345,15 @@ async def transcribe(
     ),
 ):
     """
-    동기 전사. 짧은 오디오에 권장.\n
-    Returns:\n
-        dict: 아래와 같은 구조의 STT 결과 딕셔너리를 반환합니다.\n
-            - segments (list): 오디오를 문장/의미 단위로 분할한 상세 분석 결과 목록\n 
-                - start (float): 해당 구간의 시작 시간 (초 단위)\n
-                - end (float): 해당 구간의 종료 시간 (초 단위)\n
-                - text (str): 해당 구간에서 인식된 텍스트 내용\n
-                - speaker (str): 화자 식별 ID (예: SPEAKER_00)\n
-            - text (str): 오디오 전체를 텍스트로 변환한 통합 결과\n
-            - language (str): 오디오에서 감지되거나 지정된 언어 코드 (예: 'ko')\n
-            - elapsed_s (float): 순수 STT 모델 추론(Inference)에 걸린 시간 (초 단위)\n
-            - total_elapsed_s (float): 전/후처리를 포함하여 API 요청부터 완료까지의 총 소요 시간 (초 단위)\n
-            - audio_duration_s (float): 입력된 전체 오디오 파일의 총 길이 (초 단위)\n
-            - rtf (float): Real-Time Factor (실시간 처리 지수, elapsed_s / audio_duration_s)\n
-                        (1보다 작을수록 실시간보다 빠르게 처리됨을 의미)\n
-            - ref (str, optional): 정답 텍스트 (성능 검증/벤치마크 모드가 아닐 경우 null)\n
-            - hyp (str, optional): 모델 예측 텍스트 (성능 검증/벤치마크 모드가 아닐 경우 null)\n
-            - wer (float, optional): Word Error Rate (단어 오류율, 성능 검증용 지표)\n
-            - cer (float, optional): Character Error Rate (문자 오류율, 한국어 STT 주요 평가지표)\n
+    동기 전사. 짧은 오디오에 권장.
+
+    응답은 레거시 Whisper STT 서버와 호환되도록 `chunks` / `duration` 을 포함하고,
+    동시에 우리 확장 필드(`segments`, `language`, `elapsed_s`, `total_elapsed_s`,
+    `rtf`, `wer`/`cer`) 도 함께 포함한다. 레거시 클라이언트는 `chunks` + `duration`
+    만 읽으면 되고, 새 클라이언트는 `segments` 사용 권장.
     """
     t_start = time.perf_counter()
-    await _check_audio_file(file)
+    await _check_audio_file(audio)
     _validate_speaker_range(min_speakers, max_speakers)
 
     mgr = get_manager()
@@ -318,7 +368,9 @@ async def transcribe(
             ),
         )
 
-    tmp_path = await _save_upload(file)
+    tmp_path = await _save_upload(audio)
+
+    sim_thread, sim_stop = await _start_progress_simulator(task_id, tmp_path)
     try:
         result = await mgr.transcribe(
             str(tmp_path),
@@ -331,6 +383,7 @@ async def transcribe(
         log.exception("transcribe 실패")
         raise HTTPException(status_code=500, detail=f"전사 실패: {e}")
     finally:
+        _stop_progress_simulator(task_id, sim_thread, sim_stop)
         _cleanup(tmp_path)
 
     total_elapsed = time.perf_counter() - t_start
@@ -340,15 +393,16 @@ async def transcribe(
 @app.post("/transcribe/async", response_model=JobCreateResponse, tags=["transcribe"])
 async def transcribe_async(
     background: BackgroundTasks,
-    file: UploadFile = File(...),
+    audio: UploadFile = File(..., description="오디오 파일. 폼 필드명은 'audio'."),
     language: str | None = Form(None),
+    task_id: str | None = Form(None, description="외부 큐의 task ID. /progress/{task_id} 폴링용."),
     reference: str | None = Form(None),
     diarize: bool | None = Form(None),
     min_speakers: int | None = Form(None, ge=1),
     max_speakers: int | None = Form(None, ge=1),
 ):
     """비동기 전사. 긴 파일에 권장. job_id 를 반환하며 결과는 /jobs/{id} 로 폴링."""
-    await _check_audio_file(file)
+    await _check_audio_file(audio)
     _validate_speaker_range(min_speakers, max_speakers)
 
     mgr = get_manager()
@@ -363,7 +417,7 @@ async def transcribe_async(
             ),
         )
 
-    tmp_path = await _save_upload(file)
+    tmp_path = await _save_upload(audio)
 
     job = await job_store.create()
     job.audio_path = str(tmp_path)
@@ -372,10 +426,21 @@ async def transcribe_async(
     background.add_task(
         _run_job,
         job.id, str(tmp_path), language, reference,
-        diarize, min_speakers, max_speakers,
+        diarize, min_speakers, max_speakers, task_id,
     )
 
     return JobCreateResponse(job_id=job.id, status=job.status.value)
+
+
+@app.get("/progress/{task_id}", tags=["transcribe"])
+def get_progress_endpoint(task_id: str):
+    """
+    레거시 호환 진행률 조회. /transcribe 또는 /transcribe/async 호출 시 함께 보낸
+    task_id 의 progress 를 반환. 미등록 task_id 거나 시작 전이면 0.0.
+
+    응답: `{"task_id": "...", "progress": 0.0~1.0}`
+    """
+    return {"task_id": task_id, "progress": get_progress(task_id)}
 
 
 @app.get("/jobs/{job_id}", response_model=JobStatusResponse, tags=["transcribe"])
@@ -398,6 +463,7 @@ async def _run_job(
     diarize: bool | None = None,
     min_speakers: int | None = None,
     max_speakers: int | None = None,
+    task_id: str | None = None,
 ) -> None:
     job = await job_store.get(job_id)
     if job is None:
@@ -406,6 +472,8 @@ async def _run_job(
     job.status = JobStatus.PROCESSING
     job.started_at = time.time()
     await job_store.update(job)
+
+    sim_thread, sim_stop = await _start_progress_simulator(task_id, Path(audio_path))
 
     t_start = time.perf_counter()
     try:
@@ -426,6 +494,7 @@ async def _run_job(
         job.error = str(e)
         job.status = JobStatus.ERROR
     finally:
+        _stop_progress_simulator(task_id, sim_thread, sim_stop)
         job.finished_at = time.time()
         _cleanup(audio_path)
         await job_store.update(job)

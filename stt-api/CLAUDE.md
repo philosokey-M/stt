@@ -43,13 +43,16 @@ stt-api/
 ├── README.md
 ├── Makefile              # make help 로 사용법 확인
 ├── .env.example          # 모든 설정의 단일 소스 (서버 + 파이프라인)
-├── requirements.txt      # FastAPI 계열만. whisperx/faster-whisper 는 stt env 에 이미 있음
+├── requirements.txt
+├── Dockerfile            # 운영용 컨테이너 이미지 정의
+├── docker-compose.yml    # GPU 마운트 + hf_cache 볼륨 + env_file
 ├── app/
 │   ├── main.py             # FastAPI 엔트리포인트 + lifespan
 │   ├── settings.py         # .env → pipeline_config dict 구성
 │   ├── pipeline_adapter.py # /whisperx 의 pipeline.py 를 sys.path 로 임포트
 │   ├── inference.py        # ModelManager + Semaphore + 동기/비동기 transcribe
-│   ├── language_router.py  # 런타임 언어 스위칭 (align 모델 캐시)
+│   ├── language_router.py  # 런타임 언어/화자분리 스위칭
+│   ├── progress.py         # 레거시 호환 task_id 진행률 시뮬레이션
 │   ├── jobs.py             # 비동기 job 큐 + TTL sweeper
 │   ├── audio.py            # 오디오 디코딩 / 길이
 │   ├── metrics.py          # WER / CER (/whisperx/benchmark.py 와 동일 로직)
@@ -58,25 +61,55 @@ stt-api/
     └── test_basic.py
 ```
 
+빌드 컨텍스트는 **stt-api 의 부모(프로젝트 루트)** 다. `/whisperx` 도 함께 이미지에
+COPY 되어야 `WHISPERX_DIR = API_DIR.parent / "whisperx"` 경로가 컨테이너에서도 유효.
+→ `.dockerignore` 는 프로젝트 루트(`/home/hong/workspace/test/stt/.dockerignore`)에 위치.
+
 ---
 
 ## 실행
 
+### 로컬 개발 (conda env `stt`)
+
 ```bash
-# 처음 한 번
 cp .env.example .env
 # .env 의 HF_TOKEN, DEVICE 등을 채운다
 make install         # FastAPI 등 API 전용 패키지만 stt env 에 설치
-
-# 개발 모드 (--reload, 디버그 로그)
-make dev
-
-# 프로덕션 모드 (단일 워커, 모델 1회 로드)
-make run
-
-# 헬스체크 / 빠른 전사 테스트
+make dev             # --reload, 디버그 로그
 make health
 make curl-transcribe AUDIO=../test-data/sample_01/raw_data/.../0001.wav
+```
+
+### Docker (운영)
+
+```bash
+# 1) .env 준비 (로컬과 동일)
+cp .env.example .env
+
+# 2) 첫 셋업 — 모델 캐시 채우기 (한 번만, HF_TOKEN 필요)
+make docker-warmup
+# 또는: 일시적으로 .env 의 HF_OFFLINE=false 로 두고 docker-up 한 뒤
+#       로그에서 "파이프라인 로드 완료" 확인 후 docker-down → .env 원복
+
+# 3) 평상시 기동
+make docker-up
+make docker-logs        # "STT 파이프라인 로드 완료" 떴는지 확인
+curl http://localhost:8000/health
+
+# 운영 중 .env 만 변경하고 반영
+make docker-restart
+```
+
+요구사항:
+- **NVIDIA Container Toolkit** 호스트에 설치되어 있어야 GPU 마운트 가능
+  (WSL2 + Docker Desktop 환경에선 별도 설치 없이 GPU 통과)
+- CPU 운영: `docker-compose.yml` 의 `deploy:` 블록 주석 처리 + `.env` 의 `DEVICE=cpu`
+
+GPU 동작 확인:
+```bash
+make docker-shell
+nvidia-smi              # 컨테이너 안에서 GPU 보이는지
+python -c "import torch; print(torch.cuda.is_available(), torch.cuda.device_count())"
 ```
 
 OpenAPI: `http://localhost:$(PORT)/docs`
@@ -97,12 +130,42 @@ OpenAPI: `http://localhost:$(PORT)/docs`
 
 | 필드 | 타입 | 설명 |
 |---|---|---|
-| `file` | UploadFile | 필수. wav/mp3/m4a/flac/ogg 등 |
+| `audio` | UploadFile | 필수. wav/mp3/m4a/flac/ogg 등. **레거시 호환: 필드명은 `audio`** |
 | `language` | str? | 언어 코드. 미지정 시 서버 default. align 모델은 언어별 lazy load + 캐시 |
+| `task_id` | str? | 외부 큐(Celery 등)의 task ID. 주면 `/progress/{task_id}` 로 진행률 폴링 가능 |
 | `reference` | str? | 정답 텍스트. 주면 응답에 `ref/hyp/wer/cer` 포함 |
 | `diarize` | bool? | 화자분리 사용 여부. 미지정 시 서버 default. true 인데 서버가 diarizer 미로드면 400 |
 | `min_speakers` | int? | 최소 화자 수. 미지정 시 모델 자동 추정 |
 | `max_speakers` | int? | 최대 화자 수. min>max 면 400 |
+
+### `/transcribe` 응답 (레거시 호환 + 확장)
+
+레거시 클라이언트는 `chunks` + `duration` 만 읽으면 동작. 새 클라이언트는 `segments` 권장.
+
+```json
+{
+  "chunks":   [{"text":"...","start_time":0.09,"end_time":1.27}, ...],   // ← 레거시 호환
+  "duration": 1.412,                                                       // ← 레거시 호환
+  "segments": [{"start":0.09,"end":1.27,"text":"...","speaker":"SPEAKER_00"}, ...],
+  "text":     "...",
+  "language": "ko",
+  "elapsed_s": 1.267,           // GPU 추론 시간만
+  "total_elapsed_s": 1.483,     // 엔드포인트 진입 → 응답 전체
+  "audio_duration_s": 1.412,
+  "rtf": 0.897,
+  "ref": null, "hyp": null, "wer": null, "cer": null
+}
+```
+
+### `GET /progress/{task_id}` — 레거시 호환
+
+```json
+{"task_id": "<uuid>", "progress": 0.0 ~ 1.0}
+```
+
+- 미등록 task_id 거나 시작 전이면 `progress: 0.0`
+- 완료 후 30초(DEFAULT_TTL) 까지 1.0 유지, 이후 0.0 으로 돌아감 (lazy cleanup)
+- 진행률은 **실제 모델이 아니라 `audio_duration × EXPECTED_RTF` 기반 시뮬레이션**. UX 용 추정치.
 
 응답 스키마는 `app/schemas.py::TranscribeResponse` 참고. `/results/benchmark_*.json`
 의 record 와 같은 키 (`segments[*].{start,end,text,speaker}`, `wer/cer/rtf/elapsed_s`)
@@ -250,3 +313,15 @@ STT 자체(`whisperx`, `faster-whisper`, `pyannote`, `torch` …)는 conda env `
 - GPU 일관성: pyannote(VAD/diarization) 가 CPU 에서 돌던 버그 수정.
   `/whisperx/stages/diarizer.py`, `vad.py` 에 `.to(cuda)` 추가 (승인된 예외).
   `settings.py` 가 `DEVICE` 를 vad/stt/diarization 세 섹션에 모두 전파.
+- 레거시 Whisper STT 서버 호환:
+  - 폼 필드 `file` → `audio` 로 리네임
+  - 폼 필드 `task_id` 추가 (외부 Celery 등이 전달하는 ID)
+  - `GET /progress/{task_id}` 엔드포인트 신설 — 시간 기반 진행률 시뮬레이션
+  - 응답에 `chunks` (text/start_time/end_time) + `duration` 추가 (segments 와 병행)
+  - `app/progress.py` 신설, `EXPECTED_RTF` env 추가
+- Docker 운영화:
+  - `stt-api/Dockerfile` (PyTorch+CUDA 12.4 베이스, ffmpeg/libsndfile, /whisperx 동봉)
+  - `stt-api/docker-compose.yml` (NVIDIA GPU, hf_cache 볼륨, env_file, healthcheck)
+  - `/.dockerignore` (프로젝트 루트 — test-data/results 등 빌드 컨텍스트 제외)
+  - `Makefile` 에 `docker-build/up/down/restart/logs/shell/warmup` 타겟
+  - `requirements.txt` 에 `mutagen`, `pyannote.audio` 명시 추가

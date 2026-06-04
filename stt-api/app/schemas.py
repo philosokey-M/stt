@@ -14,9 +14,28 @@ class Segment(BaseModel):
     speaker: str | None = Field(None, description="화자 라벨 (예: SPEAKER_00). 비활성화 시 null.")
 
 
-class TranscribeResponse(BaseModel):
-    """동기 전사 응답. /results/benchmark_*.json 의 record 와 동일 포맷."""
+class Chunk(BaseModel):
+    """레거시 Whisper STT 서버 호환 발화 단위. segment 와 동일 정보, 키 이름만 다름."""
 
+    text: str
+    start_time: float | None = Field(None, description="발화 시작 시각 (초)")
+    end_time: float | None = Field(None, description="발화 종료 시각 (초)")
+
+
+class TranscribeResponse(BaseModel):
+    """
+    동기 전사 응답.
+
+    레거시 Whisper STT 서버와 호환되도록 `chunks` / `duration` 필드를 포함하고,
+    동시에 우리 확장 필드(`segments`, `language`, 시간 측정, WER/CER 등)도 포함한다.
+    레거시 클라이언트는 chunks/duration 만 읽으면 되고, 확장 클라이언트는 segments 사용 권장.
+    """
+
+    # ---- 레거시 호환 필드 ----
+    chunks: list[Chunk] = Field(..., description="레거시 호환: 발화 단위. text/start_time/end_time.")
+    duration: float = Field(..., description="레거시 호환: 오디오 전체 길이(초). audio_duration_s 와 동일.")
+
+    # ---- 확장 필드 ----
     segments: list[Segment]
     text: str = Field(..., description="모든 세그먼트의 text 를 이어붙인 전체 발화")
     language: str = Field(..., description="사용된 언어 코드")

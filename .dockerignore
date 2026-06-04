@@ -1,0 +1,55 @@
+# =====================================================================
+# Docker 빌드 컨텍스트에서 제외할 파일들.
+# 위치: 프로젝트 루트 (compose 의 context: .. 가 가리키는 곳).
+# 이 파일이 없으면 test-data/ 같은 거대 디렉토리가 통째로 빌드 컨텍스트에
+# 들어가 빌드가 매우 느려지고 빌드 캐시가 자주 깨진다.
+# =====================================================================
+
+# 데이터셋 — 수 GB 단위
+test-data/
+results/
+
+# 가상환경 / 빌드 산출물
+.venv/
+venv/
+.env/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 비밀 / 로컬 설정 — 이미지에 박히면 안 됨
+**/.env
+**/.env.local
+**/.env.*.local
+**/config.local.yaml
+**/*.key
+**/*.pem
+
+# IDE / 시스템
+.vscode/
+.idea/
+.DS_Store
+*.swp
+
+# Git
+.git/
+.gitignore
+.gitattributes
+
+# 도커 자체
+**/Dockerfile
+**/docker-compose*.yml
+**/.dockerignore
+
+# 메모리/캐시 디렉토리
+.cache/
+**/.cache/huggingface/
+
+# 임시 파일
+*.log
+*.tmp
+/tmp/

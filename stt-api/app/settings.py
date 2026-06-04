@@ -66,6 +66,7 @@ class ServerSettings(BaseModel):
     job_ttl_seconds: int
     max_concurrent_inferences: int
     io_worker_threads: int
+    expected_rtf: float
 
 
 class APISettings(BaseModel):
@@ -186,6 +187,7 @@ def load_settings() -> APISettings:
         job_ttl_seconds=_env_int("JOB_TTL_SECONDS", 3600),
         max_concurrent_inferences=max(1, _env_int("MAX_CONCURRENT_INFERENCES", 1)),
         io_worker_threads=max(1, _env_int("IO_WORKER_THREADS", 4)),
+        expected_rtf=max(0.001, _env_float("EXPECTED_RTF", 0.1)),
     )
 
     return APISettings(
